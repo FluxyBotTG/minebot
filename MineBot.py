@@ -90,6 +90,11 @@ class JSONBinDB:
 db = JSONBinDB(JSONBIN_API_KEY, JSONBIN_BIN_ID)
 data = db.get_data()
 
+# Добавляем поле last_income_time для существующих пользователей
+for user_id, user in data['users'].items():
+    if 'last_income_time' not in user:
+        user['last_income_time'] = datetime.now().isoformat()
+
 # --- Вспомогательные функции ---
 def mark_dirty():
     """Пометить данные как измененные"""
@@ -152,7 +157,8 @@ def get_user(user_id):
             'exp': 0,
             'exp_to_next': 500,
             'registered_at': datetime.now().isoformat(),
-            'last_energy_update': datetime.now().isoformat()
+            'last_energy_update': datetime.now().isoformat(),
+            'last_income_time': datetime.now().isoformat()
         }
         data['total_users'] += 1
         data['new_users_today'] += 1
@@ -222,6 +228,35 @@ def mine_income_per_second(user):
         upgrades = user['mines_upgrades'].get(str(mine_index), 0)
         income += base_income * (1 + upgrades)
     return income
+
+def check_and_add_income(user):
+    """Начислить доход от шахт за прошедшее время"""
+    if 'last_income_time' not in user:
+        user['last_income_time'] = datetime.now().isoformat()
+        return 0
+    
+    try:
+        last_time = datetime.fromisoformat(user['last_income_time'])
+    except:
+        user['last_income_time'] = datetime.now().isoformat()
+        return 0
+    
+    now = datetime.now()
+    elapsed_seconds = (now - last_time).total_seconds()
+    
+    if elapsed_seconds > 0 and user['mines']:
+        income_per_sec = mine_income_per_second(user)
+        total_income = int(income_per_sec * elapsed_seconds)
+        
+        if total_income > 0:
+            user['balance'] += total_income
+            mark_dirty()
+        
+        user['last_income_time'] = now.isoformat()
+        return total_income
+    
+    user['last_income_time'] = now.isoformat()
+    return 0
 
 def format_balance(balance):
     """Форматировать баланс с разделителями тысяч"""
@@ -359,6 +394,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user = get_user(user_id)
     update_energy(user)
+    check_and_add_income(user)  # Начисляем доход при заходе
     
     user['username'] = update.effective_user.username or ''
     user['first_name'] = update.effective_user.first_name or ''
@@ -384,6 +420,7 @@ async def cmd_mine(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user = get_user(user_id)
     update_energy(user)
+    check_and_add_income(user)  # Начисляем доход
     
     if not data['bot_enabled'] and not check_admin(user_id):
         await update.message.reply_text("❌ Бот временно выключен.")
@@ -410,11 +447,16 @@ async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user = get_user(user_id)
     update_energy(user)
+    income_added = check_and_add_income(user)  # Начисляем доход
     
     mines_str = ', '.join([get_mine_info(int(i))['name'] for i in user['mines']]) if user['mines'] else 'Нет шахт'
     income_per_second = mine_income_per_second(user)
     income_per_minute = income_per_second * 60
     income_per_hour = income_per_second * 3600
+    
+    income_msg = ""
+    if income_added > 0:
+        income_msg = f"\n💵 Начислено с шахт: +{format_balance(income_added)} монет"
     
     await update.message.reply_text(
         f"👤 Ваш профиль:\n"
@@ -430,7 +472,8 @@ async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📈 Доход от шахт:\n"
         f"  • {format_balance(income_per_second)}/сек\n"
         f"  • {format_balance(income_per_minute)}/мин\n"
-        f"  • {format_balance(income_per_hour)}/час\n\n"
+        f"  • {format_balance(income_per_hour)}/час"
+        f"{income_msg}\n\n"
         f"━━━━━━━━━━━━━━━━\n"
         f"Нажмите на «Назад» чтобы вернуться в меню.",
         reply_markup=back_to_main_keyboard()
@@ -438,6 +481,10 @@ async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_top_money(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показать топ игроков по балансу"""
+    # Начисляем доход всем перед показом топа
+    for user_id, user in data['users'].items():
+        check_and_add_income(user)
+    
     top_players = get_top_players(15)
     
     if not top_players:
@@ -471,6 +518,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.reply_to_message:
         target_id = update.message.reply_to_message.from_user.id
         user = get_user(target_id)
+        check_and_add_income(user)
         await update.message.reply_text(
             f"👤 Профиль пользователя {target_id}:\n"
             f"🎖 Ранг: {get_rank(user['balance'])}\n"
@@ -485,6 +533,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if args and args[0].isdigit():
         target_id = args[0]
         user = get_user(target_id)
+        check_and_add_income(user)
         await update.message.reply_text(
             f"👤 Профиль пользователя {target_id}:\n"
             f"🎖 Ранг: {get_rank(user['balance'])}\n"
@@ -496,6 +545,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         user_id = update.effective_user.id
         user = get_user(user_id)
+        check_and_add_income(user)
         await update.message.reply_text(
             f"👤 Ваш профиль:\n"
             f"🎖 Ранг: {get_rank(user['balance'])}\n"
@@ -538,6 +588,7 @@ async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_sell_ore(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user = get_user(user_id)
+    check_and_add_income(user)
     
     if user['ore'] > 0:
         earnings = user['ore'] * 10
@@ -792,6 +843,7 @@ async def handle_mine_again(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
     user = get_user(user_id)
     update_energy(user)
+    check_and_add_income(user)
     
     if not data['bot_enabled'] and not check_admin(user_id):
         await query.answer("❌ Бот временно выключен", show_alert=True)
@@ -815,6 +867,11 @@ async def handle_mine_again(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_top_players(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик для кнопки топа игроков"""
     query = update.callback_query
+    
+    # Начисляем доход всем
+    for user_id, user in data['users'].items():
+        check_and_add_income(user)
+    
     top_players = get_top_players(15)
     
     if not top_players:
@@ -1066,6 +1123,7 @@ async def handle_start_mining(update: Update, context: ContextTypes.DEFAULT_TYPE
     user_id = query.from_user.id
     user = get_user(user_id)
     update_energy(user)
+    check_and_add_income(user)
     
     if not data['bot_enabled'] and not check_admin(user_id):
         await query.answer("❌ Бот временно выключен", show_alert=True)
@@ -1091,10 +1149,15 @@ async def handle_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
     user = get_user(user_id)
     update_energy(user)
+    income_added = check_and_add_income(user)
     
     mines_str = ', '.join([get_mine_info(int(i))['name'] for i in user['mines']]) if user['mines'] else 'Нет шахт'
     income_per_second = mine_income_per_second(user)
     income_per_minute = income_per_second * 60
+    
+    income_msg = ""
+    if income_added > 0:
+        income_msg = f"\n💵 Начислено с шахт: +{format_balance(income_added)} монет"
     
     await query.answer()
     await query.edit_message_text(
@@ -1108,7 +1171,8 @@ async def handle_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🆙 Ваши улучшения: {user['pickaxe_upgrades']}\n\n"
         f"🏭 Ваши шахты: {mines_str}\n"
         f"🆙 Улучшения шахты: {sum(user['mines_upgrades'].values())}\n"
-        f"📈 Доход от шахт: {format_balance(income_per_second)}/сек ({format_balance(income_per_minute)}/мин)\n\n"
+        f"📈 Доход от шахт: {format_balance(income_per_second)}/сек ({format_balance(income_per_minute)}/мин)"
+        f"{income_msg}\n\n"
         f"━━━━━━━━━━━━━━━━\n"
         f"Нажмите на «Назад» чтобы вернуться в меню.",
         reply_markup=back_to_main_keyboard()
@@ -1137,6 +1201,7 @@ async def handle_buy_mine(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
     user = get_user(user_id)
+    check_and_add_income(user)
     
     mine_index = int(query.data.split('_')[-1])
     mine_info = get_mine_info(mine_index)
@@ -1151,6 +1216,7 @@ async def handle_buy_mine(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     user['balance'] -= mine_info['cost']
     user['mines'].append(str(mine_index))
+    user['last_income_time'] = datetime.now().isoformat()  # Сбрасываем таймер
     mark_dirty()
     
     await query.answer(f"✅ Шахта куплена!")
@@ -1165,6 +1231,7 @@ async def handle_shop_mine_upgrades(update: Update, context: ContextTypes.DEFAUL
     query = update.callback_query
     user_id = query.from_user.id
     user = get_user(user_id)
+    check_and_add_income(user)
     
     if not user['mines']:
         await query.answer("У вас нет шахт для улучшения!", show_alert=True)
@@ -1181,6 +1248,7 @@ async def handle_upgrade_mine(update: Update, context: ContextTypes.DEFAULT_TYPE
     query = update.callback_query
     user_id = query.from_user.id
     user = get_user(user_id)
+    check_and_add_income(user)
     
     mine_index = int(query.data.split('_')[-1])
     
@@ -1197,6 +1265,7 @@ async def handle_upgrade_mine(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     user['balance'] -= upgrade_cost
     user['mines_upgrades'][str(mine_index)] = user['mines_upgrades'].get(str(mine_index), 0) + 1
+    user['last_income_time'] = datetime.now().isoformat()  # Сбрасываем таймер
     mark_dirty()
     
     new_income = mine_info['income'] * (1 + user['mines_upgrades'][str(mine_index)])
@@ -1212,6 +1281,7 @@ async def handle_shop_pickaxe_upgrade(update: Update, context: ContextTypes.DEFA
     query = update.callback_query
     user_id = query.from_user.id
     user = get_user(user_id)
+    check_and_add_income(user)
     
     await query.answer()
     await query.edit_message_text(
@@ -1224,6 +1294,7 @@ async def handle_upgrade_pickaxe(update: Update, context: ContextTypes.DEFAULT_T
     query = update.callback_query
     user_id = query.from_user.id
     user = get_user(user_id)
+    check_and_add_income(user)
     
     cost = get_pickaxe_upgrade_cost(user)
     
@@ -1296,35 +1367,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(answer)
             return
 
-# --- Автоматический доход от шахт ---
-async def auto_income(context: ContextTypes.DEFAULT_TYPE):
-    """Автоматическое начисление дохода от шахт каждую секунду"""
-    global dirty
-    
-    for user_id, user in data['users'].items():
-        if user['mines']:
-            income = mine_income_per_second(user)
-            user['balance'] += income
-            dirty = True
-    
-    save_data_if_needed()
-
-async def auto_energy(context: ContextTypes.DEFAULT_TYPE):
-    """Автоматическое восстановление энергии каждые 10 секунд"""
-    global dirty
-    
-    for user_id, user in data['users'].items():
-        if user['energy'] < 100:
-            user['energy'] = min(100, user['energy'] + 1)
-            user['last_energy_update'] = datetime.now().isoformat()
-            dirty = True
-    
-    save_data_if_needed()
-
-async def auto_save(context: ContextTypes.DEFAULT_TYPE):
-    """Автоматическое сохранение данных"""
-    save_data_if_needed()
-
 def main():
     """Запуск бота"""
     application = Application.builder().token(TOKEN).build()
@@ -1377,17 +1419,8 @@ def main():
     # Message Handler
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    # Автоматические задачи
-    job_queue = application.job_queue
-    
-    if job_queue:
-        job_queue.run_repeating(auto_income, interval=1, first=1)
-        job_queue.run_repeating(auto_energy, interval=10, first=10)
-        job_queue.run_repeating(auto_save, interval=30, first=30)
-    else:
-        logger.warning("JobQueue is not available. Background tasks disabled.")
-    
-    # Запуск бота
+    # Запуск бота (без job_queue - доход начисляется при обращении)
+    logger.info("Bot started. Income will be calculated on user interaction.")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
