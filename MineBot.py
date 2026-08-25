@@ -3,11 +3,12 @@ import random
 import asyncio
 import requests
 import threading
+import os
 from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, MessageHandler, 
-    filters, ContextTypes, JobQueue
+    filters, ContextTypes, ConversationHandler
 )
 import logging
 
@@ -25,11 +26,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- Глобальные переменные ---
-bot_enabled = True
-black_list = set()
-admins = {ADMIN_ID}
-new_users_today = 0
-last_update_day = datetime.now().day
 last_save_time = datetime.now()
 save_interval = 30  # секунд
 data_lock = threading.Lock()
@@ -52,7 +48,6 @@ class JSONBinDB:
             response = requests.get(self.base_url, headers=self.headers)
             if response.status_code == 200:
                 data = response.json()['record']
-                # Проверяем и добавляем недостающие поля
                 default_data = self.get_default_data()
                 for key, value in default_data.items():
                     if key not in data:
@@ -102,14 +97,34 @@ def mark_dirty():
     dirty = True
 
 def save_data():
-    """Сохранить данные в JSONBin немедленно"""
+    """Сохранить данные в JSONBin и локальный файл"""
     global dirty, last_save_time
-    with data_lock:
-        if db.update_data(data):
-            dirty = False
-            last_save_time = datetime.now()
-            return True
-    return False
+    try:
+        # Сохраняем в локальный файл
+        with open('bot_data.json', 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        
+        # Пробуем сохранить в JSONBin
+        try:
+            response = requests.put(
+                db.base_url, 
+                headers=db.headers, 
+                json=data,
+                timeout=10
+            )
+            if response.status_code == 200:
+                logger.info("Data saved to JSONBin successfully")
+            else:
+                logger.warning(f"JSONBin save failed: {response.status_code}")
+        except Exception as e:
+            logger.warning(f"JSONBin not available: {e}")
+        
+        dirty = False
+        last_save_time = datetime.now()
+        return True
+    except Exception as e:
+        logger.error(f"Save error: {e}")
+        return False
 
 def save_data_if_needed():
     """Сохранить данные если они были изменены и прошло достаточно времени"""
@@ -118,9 +133,7 @@ def save_data_if_needed():
     if dirty and (current_time - last_save_time).total_seconds() >= save_interval:
         with data_lock:
             if dirty:
-                if db.update_data(data):
-                    dirty = False
-                    last_save_time = current_time
+                save_data()
 
 def get_user(user_id):
     """Получить данные пользователя или создать нового"""
@@ -195,7 +208,7 @@ def update_energy(user):
     elapsed_seconds = (now - last_update).total_seconds()
     
     if elapsed_seconds >= 10:
-        energy_recovered = int(elapsed_seconds / 10)  # 1 энергия каждые 10 секунд
+        energy_recovered = int(elapsed_seconds / 10)
         if energy_recovered > 0:
             user['energy'] = min(100, user['energy'] + energy_recovered)
             user['last_energy_update'] = now.isoformat()
@@ -218,7 +231,6 @@ def get_top_players(limit=15):
     """Получить топ игроков по балансу"""
     players = []
     for user_id, user_data in data['users'].items():
-        # Получаем имя пользователя
         if user_data.get('username'):
             name = f"@{user_data['username']}"
         elif user_data.get('first_name'):
@@ -232,10 +244,7 @@ def get_top_players(limit=15):
             'level': user_data['level']
         })
     
-    # Сортируем по балансу (по убыванию)
     players.sort(key=lambda x: x['balance'], reverse=True)
-    
-    # Возвращаем топ-N игроков
     return players[:limit]
 
 def mine_once(user):
@@ -249,7 +258,6 @@ def mine_once(user):
     user['ore'] += ore_gained
     user['energy'] -= 5
     
-    # Обновление опыта
     user['exp'] += ore_gained
     while user['exp'] >= user['exp_to_next']:
         user['exp'] -= user['exp_to_next']
@@ -268,17 +276,24 @@ def mine_keyboard():
     return InlineKeyboardMarkup(keyboard)
 
 # --- Клавиатуры ---
-def main_menu_keyboard():
-    keyboard = [
-        [InlineKeyboardButton("⭐️Админ панель бота", callback_data="admin_panel")],
-        [InlineKeyboardButton("⛏Начать копать", callback_data="start_mining")],
-        [InlineKeyboardButton("👤Профиль", callback_data="profile"), 
-         InlineKeyboardButton("🛍Магазин", callback_data="shop")],
-        [InlineKeyboardButton("🏆 Топ игроков", callback_data="top_players"),
-         InlineKeyboardButton("📋Команды", callback_data="commands")],
-        [InlineKeyboardButton("❓Поддержка", callback_data="support")],
-        [InlineKeyboardButton("➕Добавить в чат", url="https://t.me/YOUR_BOT_USERNAME?startgroup=true")]
-    ]
+def main_menu_keyboard(user_id=None):
+    keyboard = []
+    
+    if user_id and check_admin(user_id):
+        keyboard.append([InlineKeyboardButton("⭐️Админ панель бота", callback_data="admin_panel")])
+    
+    keyboard.append([InlineKeyboardButton("⛏Начать копать", callback_data="start_mining")])
+    keyboard.append([
+        InlineKeyboardButton("👤Профиль", callback_data="profile"), 
+        InlineKeyboardButton("🛍Магазин", callback_data="shop")
+    ])
+    keyboard.append([
+        InlineKeyboardButton("🏆 Топ игроков", callback_data="top_players"),
+        InlineKeyboardButton("📋Команды", callback_data="commands")
+    ])
+    keyboard.append([InlineKeyboardButton("❓Поддержка", callback_data="support")])
+    keyboard.append([InlineKeyboardButton("➕Добавить в чат", url="https://t.me/YOUR_BOT_USERNAME?startgroup=true")])
+    
     return InlineKeyboardMarkup(keyboard)
 
 def admin_panel_keyboard():
@@ -288,6 +303,8 @@ def admin_panel_keyboard():
         [InlineKeyboardButton("💰 Выдать деньги", callback_data="admin_give_money")],
         [InlineKeyboardButton("📊 Статистика бота", callback_data="admin_stats")],
         [InlineKeyboardButton("📩 Рассылка", callback_data="admin_broadcast")],
+        [InlineKeyboardButton("👥 Управление админами", callback_data="admin_manage_admins")],
+        [InlineKeyboardButton("💾 Сохранить данные", callback_data="admin_save_data")],
         [InlineKeyboardButton("Назад", callback_data="back_to_main")]
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -360,7 +377,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"💰 Баланс: {format_balance(user['balance'])} монет\n"
         f"📈 Доход: {mine_income_per_second(user)}/сек\n\n"
         f"❗️Используй кнопки или команду /mine",
-        reply_markup=main_menu_keyboard()
+        reply_markup=main_menu_keyboard(user_id)
     )
 
 async def cmd_mine(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -430,7 +447,6 @@ async def cmd_top_money(update: Update, context: ContextTypes.DEFAULT_TYPE):
     top_text = "🏆 Топ игроков:\n"
     top_text += "━━━━━━━━━━━━━━━━\n\n"
     
-    # Эмодзи для первых трех мест
     medals = {1: "🥇", 2: "🥈", 3: "🥉"}
     
     for i, player in enumerate(top_players, 1):
@@ -439,10 +455,7 @@ async def cmd_top_money(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             prefix = f"{i}."
         
-        # Форматируем баланс
         balance_formatted = format_balance(player['balance'])
-        
-        # Добавляем строку с игроком
         top_text += f"{prefix} {player['name']} - {balance_formatted} монет\n"
     
     top_text += "\n━━━━━━━━━━━━━━━━"
@@ -455,7 +468,6 @@ async def cmd_top_money(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показать статистику пользователя (свою или по reply/ID)"""
     
-    # Проверяем, есть ли ответ на сообщение
     if update.message.reply_to_message:
         target_id = update.message.reply_to_message.from_user.id
         user = get_user(target_id)
@@ -469,7 +481,6 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    # Проверяем аргументы
     args = context.args
     if args and args[0].isdigit():
         target_id = args[0]
@@ -483,7 +494,6 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🏭 Шахты: {len(user['mines'])}"
         )
     else:
-        # Если нет аргументов и нет reply - показываем свою статистику
         user_id = update.effective_user.id
         user = get_user(user_id)
         await update.message.reply_text(
@@ -509,7 +519,6 @@ async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показать ID пользователя (свой или по reply)"""
     
-    # Если есть ответ на сообщение
     if update.message.reply_to_message:
         replied_user = update.message.reply_to_message.from_user
         await update.message.reply_text(
@@ -519,7 +528,6 @@ async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📝 Username: @{replied_user.username if replied_user.username else 'нет'}"
         )
     else:
-        # Показываем свой ID
         await update.message.reply_text(
             f"👤 Ваша информация:\n"
             f"🆔 Ваш ID: {update.effective_user.id}\n"
@@ -532,7 +540,6 @@ async def cmd_sell_ore(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = get_user(user_id)
     
     if user['ore'] > 0:
-        # Цена: просто добавляем 0 в конец (умножаем на 10)
         earnings = user['ore'] * 10
         user['balance'] += earnings
         user['ore'] = 0
@@ -544,6 +551,34 @@ async def cmd_sell_ore(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     else:
         await update.message.reply_text("❌ У вас нет руды для продажи!")
+
+async def cmd_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда для принудительного сохранения данных: /save"""
+    user_id = update.effective_user.id
+    
+    if not check_admin(user_id):
+        await update.message.reply_text("❌ У вас нет доступа!")
+        return
+    
+    msg = await update.message.reply_text("💾 Сохраняю данные...")
+    
+    success = save_data()
+    
+    if success:
+        total_balance = sum(u['balance'] for u in data['users'].values())
+        await msg.edit_text(
+            f"✅ Данные успешно сохранены!\n\n"
+            f"📊 Статистика:\n"
+            f"👥 Пользователей: {data['total_users']}\n"
+            f"💰 Всего монет: {format_balance(total_balance)}\n"
+            f"🏭 Всего шахт: {sum(len(u['mines']) for u in data['users'].values())}\n"
+            f"🕐 Время: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+    else:
+        await msg.edit_text(
+            f"❌ Ошибка при сохранении данных!\n"
+            f"🕐 Время: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        )
 
 async def cmd_teach(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда для обучения бота: /teach вопрос | ответ"""
@@ -583,7 +618,6 @@ async def cmd_permban(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ У вас нет доступа!")
         return
     
-    # Если есть ответ на сообщение
     if update.message.reply_to_message:
         target_id = str(update.message.reply_to_message.from_user.id)
         if target_id not in data['black_list']:
@@ -594,7 +628,6 @@ async def cmd_permban(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"❌ Пользователь {target_id} уже в черном списке.")
         return
     
-    # Обычное использование с аргументами
     args = context.args
     if args and args[0].isdigit():
         target_id = args[0]
@@ -619,7 +652,6 @@ async def cmd_unperm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ У вас нет доступа!")
         return
     
-    # Если есть ответ на сообщение
     if update.message.reply_to_message:
         target_id = str(update.message.reply_to_message.from_user.id)
         if target_id in data['black_list']:
@@ -630,7 +662,6 @@ async def cmd_unperm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"❌ Пользователь {target_id} не в черном списке.")
         return
     
-    # Обычное использование с аргументами
     args = context.args
     if args and args[0].isdigit():
         target_id = args[0]
@@ -655,11 +686,9 @@ async def cmd_givemoney(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ У вас нет доступа!")
         return
     
-    # Если есть ответ на сообщение
     if update.message.reply_to_message:
         target_id = str(update.message.reply_to_message.from_user.id)
         
-        # Проверяем, есть ли сумма в аргументах
         args = context.args
         if args and args[0].isdigit():
             amount = int(args[0])
@@ -678,7 +707,6 @@ async def cmd_givemoney(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
     
-    # Обычное использование с аргументами
     args = context.args
     if len(args) >= 2 and args[0].isdigit() and args[1].isdigit():
         target_id = args[0]
@@ -697,13 +725,57 @@ async def cmd_givemoney(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Ответьте на сообщение + /givemoney [сумма] - выдать пользователю"
         )
 
+async def cmd_addadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Добавить администратора: /addadmin [ID]"""
+    user_id = update.effective_user.id
+    
+    if not check_admin(user_id):
+        await update.message.reply_text("❌ У вас нет доступа!")
+        return
+    
+    args = context.args
+    if args and args[0].isdigit():
+        target_id = int(args[0])
+        if target_id not in data['admins']:
+            data['admins'].append(target_id)
+            mark_dirty()
+            await update.message.reply_text(f"✅ Пользователь {target_id} добавлен в администраторы.")
+        else:
+            await update.message.reply_text(f"❌ Пользователь {target_id} уже администратор.")
+    else:
+        await update.message.reply_text("Использование: /addadmin [ID]")
+
+async def cmd_removeadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Удалить администратора: /removeadmin [ID]"""
+    user_id = update.effective_user.id
+    
+    if not check_admin(user_id):
+        await update.message.reply_text("❌ У вас нет доступа!")
+        return
+    
+    args = context.args
+    if args and args[0].isdigit():
+        target_id = int(args[0])
+        if target_id == ADMIN_ID:
+            await update.message.reply_text("❌ Нельзя удалить основателя!")
+            return
+        if target_id in data['admins']:
+            data['admins'].remove(target_id)
+            mark_dirty()
+            await update.message.reply_text(f"✅ Пользователь {target_id} удален из администраторов.")
+        else:
+            await update.message.reply_text(f"❌ Пользователь {target_id} не администратор.")
+    else:
+        await update.message.reply_text("Использование: /removeadmin [ID]")
+
 # --- Callback Query Handlers ---
 async def handle_back_to_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    user_id = query.from_user.id
     await query.answer()
     await query.edit_message_text(
         "Главное меню:",
-        reply_markup=main_menu_keyboard()
+        reply_markup=main_menu_keyboard(user_id)
     )
 
 async def handle_back_to_shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -752,7 +824,6 @@ async def handle_top_players(update: Update, context: ContextTypes.DEFAULT_TYPE)
     top_text = "🏆 Топ игроков:\n"
     top_text += "━━━━━━━━━━━━━━━━\n\n"
     
-    # Эмодзи для первых трех мест
     medals = {1: "🥇", 2: "🥈", 3: "🥉"}
     
     for i, player in enumerate(top_players, 1):
@@ -761,10 +832,7 @@ async def handle_top_players(update: Update, context: ContextTypes.DEFAULT_TYPE)
         else:
             prefix = f"{i}."
         
-        # Форматируем баланс
         balance_formatted = format_balance(player['balance'])
-        
-        # Добавляем строку с игроком
         top_text += f"{prefix} {player['name']} - {balance_formatted} монет\n"
     
     top_text += "\n━━━━━━━━━━━━━━━━"
@@ -802,7 +870,6 @@ async def handle_admin_settings(update: Update, context: ContextTypes.DEFAULT_TY
             f"{'✅' if data['bot_enabled'] else '❌'} Бот {'включен' if data['bot_enabled'] else 'выключен'}", 
             callback_data="toggle_bot"
         )],
-        [InlineKeyboardButton("🔐 Доступ к АП", callback_data="admin_access")],
         [InlineKeyboardButton("Назад", callback_data="admin_panel")]
     ]
     
@@ -826,7 +893,27 @@ async def handle_toggle_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer(f"Бот {'включен' if data['bot_enabled'] else 'выключен'}")
     await handle_admin_settings(update, context)
 
-async def handle_admin_access(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_admin_save_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик кнопки сохранения данных"""
+    query = update.callback_query
+    user_id = query.from_user.id
+    
+    if not check_admin(user_id):
+        await query.answer("Доступ запрещен!", show_alert=True)
+        return
+    
+    if save_data():
+        await query.answer("✅ Данные сохранены!", show_alert=True)
+        await query.edit_message_text(
+            f"✅ Данные успешно сохранены!\n"
+            f"🕐 Время: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            reply_markup=admin_panel_keyboard()
+        )
+    else:
+        await query.answer("❌ Ошибка сохранения!", show_alert=True)
+
+async def handle_admin_manage_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Управление администраторами"""
     query = update.callback_query
     user_id = query.from_user.id
     
@@ -835,17 +922,58 @@ async def handle_admin_access(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     
     keyboard = [
-        [InlineKeyboardButton("➕ Добавить администратора", callback_data="admin_add_prompt")],
-        [InlineKeyboardButton("➖ Удалить администратора", callback_data="admin_remove_prompt")],
-        [InlineKeyboardButton("Назад", callback_data="admin_settings")]
+        [InlineKeyboardButton("➕ Добавить админа", callback_data="admin_add_prompt")],
+        [InlineKeyboardButton("➖ Удалить админа", callback_data="admin_remove_prompt")],
+        [InlineKeyboardButton("Назад", callback_data="admin_panel")]
     ]
     
-    admins_list = '\n'.join([str(aid) for aid in data['admins']])
+    admins_list = '\n'.join([f"• {aid}" for aid in data['admins']])
     
     await query.answer()
     await query.edit_message_text(
-        f"🔐 Доступ к админ-панели:\n\n{admins_list}",
+        f"👥 Управление администраторами\n\n"
+        f"Текущие админы:\n{admins_list}\n\n"
+        f"Для добавления: /addadmin [ID]\n"
+        f"Для удаления: /removeadmin [ID]",
         reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def handle_admin_add_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Запрос на добавление админа"""
+    query = update.callback_query
+    user_id = query.from_user.id
+    
+    if not check_admin(user_id):
+        await query.answer("Доступ запрещен!", show_alert=True)
+        return
+    
+    await query.answer()
+    await query.edit_message_text(
+        "➕ Добавление администратора\n\n"
+        "Используйте команду:\n"
+        "/addadmin [ID]\n\n"
+        "Например:\n"
+        "/addadmin 123456789",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data="admin_manage_admins")]])
+    )
+
+async def handle_admin_remove_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Запрос на удаление админа"""
+    query = update.callback_query
+    user_id = query.from_user.id
+    
+    if not check_admin(user_id):
+        await query.answer("Доступ запрещен!", show_alert=True)
+        return
+    
+    await query.answer()
+    await query.edit_message_text(
+        "➖ Удаление администратора\n\n"
+        "Используйте команду:\n"
+        "/removeadmin [ID]\n\n"
+        "Например:\n"
+        "/removeadmin 123456789",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data="admin_manage_admins")]])
     )
 
 async def handle_admin_blacklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -904,6 +1032,7 @@ async def handle_admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE)
         f"Всего монет: {format_balance(total_money)}\n"
         f"Всего шахт: {total_mines}\n"
         f"Всего в ЧС: {len(data['black_list'])}\n"
+        f"Админов: {len(data['admins'])}\n"
         f"FAQs: {len(data['faq'])}"
     )
     
@@ -1148,31 +1277,24 @@ async def handle_commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     
-    # Проверка черного списка
     if str(user_id) in data['black_list']:
         await update.message.reply_text("❌ Вы заблокированы в боте.")
         return
     
-    # Проверка включен ли бот
     if not data['bot_enabled'] and not check_admin(user_id):
         await update.message.reply_text("❌ Бот временно выключен.")
         return
     
-    # Поиск ответа в FAQ
     message_text = update.message.text.lower()
     
-    # Точное совпадение
     if message_text in data['faq']:
         await update.message.reply_text(data['faq'][message_text])
         return
     
-    # Поиск по ключевым словам
     for question, answer in data['faq'].items():
         if any(word in message_text for word in question.split()):
             await update.message.reply_text(answer)
             return
-    
-    # Если ответ не найден - ничего не отвечаем
 
 # --- Автоматический доход от шахт ---
 async def auto_income(context: ContextTypes.DEFAULT_TYPE):
@@ -1185,7 +1307,6 @@ async def auto_income(context: ContextTypes.DEFAULT_TYPE):
             user['balance'] += income
             dirty = True
     
-    # Сохраняем данные периодически
     save_data_if_needed()
 
 async def auto_energy(context: ContextTypes.DEFAULT_TYPE):
@@ -1217,10 +1338,13 @@ def main():
     application.add_handler(CommandHandler("ping", cmd_ping))
     application.add_handler(CommandHandler("id", cmd_id))
     application.add_handler(CommandHandler("sellore", cmd_sell_ore))
+    application.add_handler(CommandHandler("save", cmd_save))
     application.add_handler(CommandHandler("teach", cmd_teach))
     application.add_handler(CommandHandler("permban", cmd_permban))
     application.add_handler(CommandHandler("unperm", cmd_unperm))
     application.add_handler(CommandHandler("givemoney", cmd_givemoney))
+    application.add_handler(CommandHandler("addadmin", cmd_addadmin))
+    application.add_handler(CommandHandler("removeadmin", cmd_removeadmin))
     
     # Callback Query Handlers
     application.add_handler(CallbackQueryHandler(handle_mine_again, pattern="^mine_again$"))
@@ -1230,7 +1354,10 @@ def main():
     application.add_handler(CallbackQueryHandler(handle_admin_panel, pattern="^admin_panel$"))
     application.add_handler(CallbackQueryHandler(handle_admin_settings, pattern="^admin_settings$"))
     application.add_handler(CallbackQueryHandler(handle_toggle_bot, pattern="^toggle_bot$"))
-    application.add_handler(CallbackQueryHandler(handle_admin_access, pattern="^admin_access$"))
+    application.add_handler(CallbackQueryHandler(handle_admin_save_data, pattern="^admin_save_data$"))
+    application.add_handler(CallbackQueryHandler(handle_admin_manage_admins, pattern="^admin_manage_admins$"))
+    application.add_handler(CallbackQueryHandler(handle_admin_add_prompt, pattern="^admin_add_prompt$"))
+    application.add_handler(CallbackQueryHandler(handle_admin_remove_prompt, pattern="^admin_remove_prompt$"))
     application.add_handler(CallbackQueryHandler(handle_admin_blacklist, pattern="^admin_blacklist$"))
     application.add_handler(CallbackQueryHandler(handle_admin_give_money, pattern="^admin_give_money$"))
     application.add_handler(CallbackQueryHandler(handle_admin_stats, pattern="^admin_stats$"))
@@ -1254,13 +1381,8 @@ def main():
     job_queue = application.job_queue
     
     if job_queue:
-        # Доход от шахт каждую секунду
         job_queue.run_repeating(auto_income, interval=1, first=1)
-        
-        # Восстановление энергии каждые 10 секунд
         job_queue.run_repeating(auto_energy, interval=10, first=10)
-        
-        # Автосохранение каждые 30 секунд
         job_queue.run_repeating(auto_save, interval=30, first=30)
     else:
         logger.warning("JobQueue is not available. Background tasks disabled.")
