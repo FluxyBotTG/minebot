@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, MessageHandler, 
-    filters, ContextTypes, ConversationHandler
+    filters, ContextTypes, JobQueue
 )
 import logging
 
@@ -1253,14 +1253,17 @@ def main():
     # Автоматические задачи
     job_queue = application.job_queue
     
-    # Доход от шахт каждую секунду
-    job_queue.run_repeating(auto_income, interval=1, first=1)
-    
-    # Восстановление энергии каждые 10 секунд
-    job_queue.run_repeating(auto_energy, interval=10, first=10)
-    
-    # Автосохранение каждые 30 секунд
-    job_queue.run_repeating(auto_save, interval=30, first=30)
+    if job_queue:
+        # Доход от шахт каждую секунду
+        job_queue.run_repeating(auto_income, interval=1, first=1)
+        
+        # Восстановление энергии каждые 10 секунд
+        job_queue.run_repeating(auto_energy, interval=10, first=10)
+        
+        # Автосохранение каждые 30 секунд
+        job_queue.run_repeating(auto_save, interval=30, first=30)
+    else:
+        logger.warning("JobQueue is not available. Background tasks disabled.")
     
     # Запуск бота
     application.run_polling(allowed_updates=Update.ALL_TYPES)
